@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-YB Tools - 自动更新模块
+YB Tools - Auto Update Module
 """
 
 import os
@@ -10,88 +10,119 @@ import zipfile
 import shutil
 import tempfile
 
-# 版本配置文件
+# Version configuration file
 VERSION_CONFIG_FILE = "version.json"
 
-# GitHub 配置
+# GitHub configuration
 GITHUB_USER = "yongbin1999"
 GITHUB_REPO = "YB_Nuke_ToolSets"
 GITHUB_API_URL = "https://api.github.com/repos/{}/{}/releases/latest".format(GITHUB_USER, GITHUB_REPO)
 
-# 更新配置
-UPDATE_CHECK_TIMEOUT = 5  # 检测超时时间（秒）
-UPDATE_MARKER_FILE = ".update_pending"  # 标记文件
+# Update configuration
+UPDATE_CHECK_TIMEOUT = 10  # Check timeout in seconds
+
+
+def _nuke_tprint(message):
+    """
+    Safely print message to Nuke terminal (Script Editor)
+    Works in both main thread and background threads
+    """
+    try:
+        import nuke
+        
+        def _print_in_main_thread():
+            """Print message in main thread"""
+            try:
+                nuke.tprint(message)
+            except Exception:
+                pass
+        
+        # Try to use executeInMainThread for thread safety
+        try:
+            nuke.executeInMainThread(_print_in_main_thread)
+        except Exception:
+            # Fallback: try direct tprint (may work in main thread)
+            try:
+                nuke.tprint(message)
+            except Exception:
+                # Last resort: do nothing (silent failure)
+                pass
+    except ImportError:
+        # Nuke not available, do nothing
+        pass
 
 
 def get_plugin_root():
-    """获取插件根目录"""
+    """Get plugin root directory"""
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def load_version_config():
     """
-    从 version.json 读取版本配置
+    Load version configuration from version.json
     
-    返回：
+    Returns:
         dict: {"version": "2.2.1", "auto_update": true}
-        如果文件不存在或格式错误，返回默认配置
+        Returns default config if file doesn't exist or format is invalid
     """
     config_path = os.path.join(get_plugin_root(), VERSION_CONFIG_FILE)
     
     try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except (UnicodeDecodeError, TypeError):
+            # Fallback for Python 2 or old files
+            with open(config_path, 'r') as f:
+                config = json.load(f)
             
-        # 验证必需字段
+        # Validate required fields
         if 'version' not in config:
-            print("[YB Tools] 警告: version.json 缺少 'version' 字段")
             return {"version": "0.0.0", "auto_update": True}
             
-        # 默认启用自动更新
+        # Enable auto-update by default
         if 'auto_update' not in config:
             config['auto_update'] = True
             
         return config
         
-    except Exception as e:
-        print("[YB Tools] 读取 version.json 失败: {}".format(e))
+    except Exception:
         return {"version": "0.0.0", "auto_update": True}
 
 
 def get_current_version():
-    """获取当前版本号"""
+    """Get current version number"""
     config = load_version_config()
     return config.get('version', '0.0.0')
 
 
 def is_auto_update_enabled():
-    """检查是否启用自动更新"""
+    """Check if auto-update is enabled"""
     config = load_version_config()
     return config.get('auto_update', True)
 
 
 def parse_version(version_str):
     """
-    解析版本号为可比较的元组
-
+    Parse version string into comparable tuple
     """
-    # 移除 'v' 前缀
+    # Remove 'v' prefix
     version_str = version_str.lstrip('vV')
     try:
         parts = version_str.split('.')
-        return tuple(int(p) for p in parts[:3])  # 只取前三位
+        return tuple(int(p) for p in parts[:3])  # Only take first 3 parts
     except (ValueError, AttributeError):
         return (0, 0, 0)
 
 
 def compare_versions(current, latest):
     """
-    比较两个版本号
+    Compare two version numbers
     
-    返回：
-    1: latest > current (有新版本)
-    0: latest == current (版本相同)
-    -1: latest < current (本地版本更新)
+    Returns:
+    1: latest > current (new version available)
+    0: latest == current (same version)
+    -1: latest < current (local version is newer)
     """
     current_tuple = parse_version(current)
     latest_tuple = parse_version(latest)
@@ -104,32 +135,67 @@ def compare_versions(current, latest):
         return -1
 
 
-def check_for_updates():
+def check_for_updates(return_error=False):
     """
-    检查是否有新版本（异步执行）
+    Check for new version (executed asynchronously)
+    
+    Args:
+        return_error: If True, return error message instead of None on failure
+    
+    Returns:
+        dict: Update info dict, or None/error dict on failure
     """
     try:
-        # Python 2/3 兼容的 HTTP 请求
+        # Python 2/3 compatible HTTP request
         try:
             # Python 3
             from urllib.request import urlopen, Request
-            from urllib.error import URLError
+            from urllib.error import URLError, HTTPError
         except ImportError:
             # Python 2
-            from urllib2 import urlopen, Request, URLError
+            from urllib2 import urlopen, Request, URLError, HTTPError
         
-        # 设置 User-Agent（GitHub API 要求）
+        # Set User-Agent (required by GitHub API)
         request = Request(GITHUB_API_URL)
         request.add_header('User-Agent', 'YB-Tools-Updater')
         
-        # 请求 GitHub API
-        response = urlopen(request, timeout=UPDATE_CHECK_TIMEOUT)
-        data = json.loads(response.read().decode('utf-8'))
+        # Request GitHub API
+        try:
+            response = urlopen(request, timeout=UPDATE_CHECK_TIMEOUT)
+        except URLError as e:
+            if return_error:
+                error_msg = str(e)
+                if 'timeout' in error_msg.lower() or 'timed out' in error_msg.lower():
+                    return {'error': 'Connection timeout. Please check your network connection.'}
+                elif 'Name or service not known' in error_msg or 'getaddrinfo failed' in error_msg:
+                    return {'error': 'Cannot resolve GitHub domain. Please check your DNS settings.'}
+                else:
+                    return {'error': 'Network error: {}. Please check your network connection.'.format(error_msg)}
+            return None
+        except HTTPError as e:
+            if return_error:
+                return {'error': 'GitHub API error ({}): {}. Please try again later.'.format(e.code, e.reason)}
+            return None
+        
+        try:
+            data = json.loads(response.read().decode('utf-8'))
+        except ValueError as e:
+            if return_error:
+                return {'error': 'Invalid response from GitHub API. Please try again later.'}
+            return None
         
         latest_version = data.get('tag_name', '').lstrip('vV')
+        if not latest_version:
+            if return_error:
+                return {'error': 'No version information found in GitHub release.'}
+            return None
         
-        # 比较版本
-        if compare_versions(get_current_version(), latest_version) >= 0:
+        current_version = get_current_version()
+        
+        # Compare versions
+        compare_result = compare_versions(current_version, latest_version)
+        
+        if compare_result != 1:  # Only 1 means new version available
             return {
                 'has_update': False,
                 'latest_version': latest_version,
@@ -137,7 +203,7 @@ def check_for_updates():
                 'release_notes': None
             }
         
-        # 查找 zip 下载链接
+        # Find zip download link
         download_url = None
         assets = data.get('assets', [])
         for asset in assets:
@@ -145,7 +211,7 @@ def check_for_updates():
                 download_url = asset.get('browser_download_url')
                 break
         
-        # 如果没有上传 zip，使用源码 zip
+        # If no zip uploaded, use source zip
         if not download_url:
             download_url = data.get('zipball_url')
         
@@ -158,307 +224,402 @@ def check_for_updates():
         }
         
     except Exception as e:
-        # 静默失败，不影响 Nuke 启动
-        print("[YB Tools] 检查更新失败: {}".format(str(e)))
+        # Fail silently for background checks, return error for manual checks
+        if return_error:
+            return {'error': 'Unexpected error: {}. Please try again later.'.format(str(e))}
         return None
 
 
-def download_update(download_url, target_path):
+def download_update(download_url, target_path, progress_callback=None):
     """
-    下载更新包
+    Download update package
     
-    返回：
-    True: 下载成功
-    False: 下载失败
+    Args:
+        download_url: URL to download from
+        target_path: Local path to save the file
+        progress_callback: Optional callback function(status, progress) for progress updates
+    
+    Returns:
+    True: Download successful
+    False: Download failed
     """
     try:
         try:
-            from urllib.request import urlretrieve
+            from urllib.request import urlopen, Request
         except ImportError:
-            from urllib import urlretrieve
+            from urllib2 import urlopen, Request
         
-        print("[YB Tools] 正在下载更新...")
-        urlretrieve(download_url, target_path)
-        print("[YB Tools] 下载完成: {}".format(target_path))
+        if progress_callback:
+            progress_callback("downloading", 0)
+        
+        request = Request(download_url)
+        request.add_header('User-Agent', 'YB-Tools-Updater')
+        
+        response = urlopen(request)
+        total_size = int(response.headers.get('Content-Length', 0))
+        downloaded = 0
+        chunk_size = 8192
+        
+        with open(target_path, 'wb') as f:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                
+                if progress_callback and total_size > 0:
+                    progress = int((downloaded / total_size) * 100)
+                    progress_callback("downloading", progress)
+        
+        if progress_callback:
+            progress_callback("downloading", 100)
+        
         return True
         
-    except Exception as e:
-        print("[YB Tools] 下载更新失败: {}".format(str(e)))
+    except Exception:
         return False
 
 
-def apply_update(zip_path):
+def find_plugin_root_in_dir(directory):
     """
-    应用更新（解压到插件目录）
+    Find plugin root directory in extracted directory
     
-    注意：
-    这个函数应该在 Nuke 下次启动时执行
-    当前运行中的文件无法被替换
+    Plugin root directory should contain init.py and menu.py files
+    """
+    # Check if current directory is plugin root
+    if os.path.exists(os.path.join(directory, 'init.py')) and \
+       os.path.exists(os.path.join(directory, 'menu.py')):
+        return directory
+    
+    # Recursively search subdirectories
+    for root, dirs, files in os.walk(directory):
+        if 'init.py' in files and 'menu.py' in files:
+            return root
+    
+    return None
+
+
+def apply_update(zip_path, new_version=None):
+    """
+    Apply update (extract to plugin directory)
+    
+    Args:
+        zip_path: Path to the update ZIP file
+        new_version: New version string to update in version.json (optional)
+    
+    Returns:
+        bool: True if update was successful, False otherwise
     """
     plugin_root = get_plugin_root()
     temp_dir = None
     
     try:
-        # 创建临时目录
+        # Validate ZIP file
+        if not os.path.exists(zip_path):
+            return False
+        
+        # Check if ZIP file is valid
+        try:
+            # Python 2/3 compatible BadZipFile exception
+            try:
+                BadZipFile = zipfile.BadZipFile
+            except AttributeError:
+                # Python 2 uses zipfile.error
+                BadZipFile = zipfile.error
+            
+            with zipfile.ZipFile(zip_path, 'r') as test_zip:
+                test_zip.testzip()
+        except (BadZipFile, zipfile.error):
+            return False
+        except Exception:
+            return False
+        
+        # Create temporary directory
         temp_dir = tempfile.mkdtemp(prefix='yb_tools_update_')
         
-        # 解压更新包
-        print("[YB Tools] 正在解压更新包...")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
+        # Extract update package
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # Extract all files
+                zip_ref.extractall(temp_dir)
+        except Exception:
+            return False
         
-        # 查找解压后的根目录
-        # GitHub 的 zipball 会有一个额外的目录层级
-        extracted_items = os.listdir(temp_dir)
-        if len(extracted_items) == 1 and os.path.isdir(os.path.join(temp_dir, extracted_items[0])):
-            source_dir = os.path.join(temp_dir, extracted_items[0])
-        else:
-            source_dir = temp_dir
+        # Find plugin root directory
+        source_dir = find_plugin_root_in_dir(temp_dir)
         
-        # 备份当前版本
-        backup_dir = plugin_root + '_backup'
-        if os.path.exists(backup_dir):
-            shutil.rmtree(backup_dir)
-        shutil.copytree(plugin_root, backup_dir)
-        print("[YB Tools] 已备份当前版本到: {}".format(backup_dir))
+        if not source_dir:
+            # If not found, try other methods
+            extracted_items = os.listdir(temp_dir)
+            
+            # If only one directory, might be GitHub zipball format
+            if len(extracted_items) == 1 and os.path.isdir(os.path.join(temp_dir, extracted_items[0])):
+                nested_dir = os.path.join(temp_dir, extracted_items[0])
+                source_dir = find_plugin_root_in_dir(nested_dir)
+                if not source_dir:
+                    source_dir = nested_dir
+            else:
+                source_dir = temp_dir
         
-        # 复制新文件（排除某些文件）
-        exclude_patterns = ['.git', '__pycache__', '*.pyc', '.update_pending', '_backup']
+        if not source_dir:
+            return False
         
+        # Verify source directory contains necessary files
+        if not os.path.exists(os.path.join(source_dir, 'init.py')):
+            return False
+        
+        # Copy new files (exclude certain files)
+        exclude_patterns = ['.git', '__pycache__', '.DS_Store']
+        exclude_files = []
+        
+        copied_count = 0
         for item in os.listdir(source_dir):
-            # 跳过排除的文件/目录
+            # Skip excluded files/directories
+            if item in exclude_files:
+                continue
             if any(pattern in item for pattern in exclude_patterns):
                 continue
             
             source_item = os.path.join(source_dir, item)
             target_item = os.path.join(plugin_root, item)
             
-            # 删除旧文件/目录
-            if os.path.exists(target_item):
-                if os.path.isdir(target_item):
-                    shutil.rmtree(target_item)
+            try:
+                # Delete old files/directories
+                if os.path.exists(target_item):
+                    if os.path.isdir(target_item):
+                        shutil.rmtree(target_item)
+                    else:
+                        os.remove(target_item)
+                
+                # Copy new files/directories
+                if os.path.isdir(source_item):
+                    shutil.copytree(source_item, target_item)
                 else:
-                    os.remove(target_item)
-            
-            # 复制新文件/目录
-            if os.path.isdir(source_item):
-                shutil.copytree(source_item, target_item)
-            else:
-                shutil.copy2(source_item, target_item)
-        
-        print("[YB Tools] 更新应用成功！")
-        return True
-        
-    except Exception as e:
-        print("[YB Tools] 应用更新失败: {}".format(str(e)))
-        
-        # 尝试恢复备份
-        if backup_dir and os.path.exists(backup_dir):
-            try:
-                shutil.rmtree(plugin_root)
-                shutil.copytree(backup_dir, plugin_root)
-                print("[YB Tools] 已恢复到备份版本")
+                    shutil.copy2(source_item, target_item)
+                copied_count += 1
             except Exception:
+                # Continue processing other files
                 pass
         
-        return False
-        
-    finally:
-        # 清理临时目录
-        if temp_dir and os.path.exists(temp_dir):
+        # Update successful, update version.json if new version is provided
+        if new_version:
             try:
-                shutil.rmtree(temp_dir)
+                config_path = os.path.join(plugin_root, VERSION_CONFIG_FILE)
+                config = load_version_config()
+                config['version'] = new_version
+                # Preserve auto_update setting
+                try:
+                    with open(config_path, 'w', encoding='utf-8') as f:
+                        json.dump(config, f, indent=4, ensure_ascii=False)
+                except (TypeError, UnicodeEncodeError):
+                    # Fallback for Python 2
+                    with open(config_path, 'w') as f:
+                        json.dump(config, f, indent=4)
             except Exception:
+                # Continue even if version update fails
                 pass
         
-        # 删除更新包
+        # Delete ZIP file
         if os.path.exists(zip_path):
             try:
                 os.remove(zip_path)
             except Exception:
                 pass
-
-
-def check_pending_update():
-    """
-    检查是否有待应用的更新
-    
-    如果上次下载了更新包但还没应用，现在应用它
-    """
-    plugin_root = get_plugin_root()
-    marker_file = os.path.join(plugin_root, UPDATE_MARKER_FILE)
-    
-    if not os.path.exists(marker_file):
-        return
-    
-    try:
-        # 读取标记文件
-        with open(marker_file, 'r') as f:
-            data = json.load(f)
         
-        zip_path = data.get('zip_path')
-        latest_version = data.get('latest_version')
+        return True
         
-        if not zip_path or not os.path.exists(zip_path):
-            # 更新包不存在，删除标记
-            os.remove(marker_file)
-            return
+    except Exception:
+        return False
         
-        # 询问用户是否应用更新
-        try:
-            import nuke
-            result = nuke.ask(
-                "YB Tools 有新版本 v{} 已下载完成！\n\n"
-                "是否现在更新？\n\n"
-                "注意：更新过程中 Nuke 可能会短暂卡顿".format(latest_version)
-            )
-            
-            if result:
-                # 应用更新
-                if apply_update(zip_path):
-                    os.remove(marker_file)
-                    nuke.message(
-                        "YB Tools 已更新到 v{}！\n\n"
-                        "请重启 Nuke 以使用新版本。".format(latest_version)
-                    )
-                else:
-                    nuke.message("更新失败，请手动下载安装。")
-            else:
-                # 用户取消，保留标记，下次启动再问
+    finally:
+        # Clean up temporary directory
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
                 pass
-                
-        except ImportError:
-            # 不在 Nuke 环境中
-            pass
-            
-    except Exception as e:
-        print("[YB Tools] 检查待更新失败: {}".format(str(e)))
-        # 删除损坏的标记文件
-        try:
-            os.remove(marker_file)
-        except Exception:
-            pass
 
 
-def download_update_async(update_info):
+def download_and_apply_update_async(update_info, is_auto_update=False, status_callback=None):
     """
-    后台下载更新（异步执行）
+    Download and apply update immediately in background
+    
+    Args:
+        update_info: Update information dict
+        is_auto_update: If True, this is an automatic update (silent download, show notification after)
+                        If False, this is a manual update (show progress, show notification after)
+        status_callback: Optional callback function(status, message, progress) for UI updates
+                         status: 'checking', 'downloading', 'applying', 'completed', 'error'
+                         message: Status message string
+                         progress: Progress percentage (0-100) or None
     """
-    def _download_thread():
+    def _download_and_apply_thread():
+        # Note: os, sys, importlib are already imported at module level
         plugin_root = get_plugin_root()
         zip_path = os.path.join(tempfile.gettempdir(), 'yb_tools_update.zip')
         
-        # 下载更新
-        if download_update(update_info['download_url'], zip_path):
-            # 创建标记文件
-            marker_file = os.path.join(plugin_root, UPDATE_MARKER_FILE)
-            try:
-                with open(marker_file, 'w') as f:
-                    json.dump({
-                        'zip_path': zip_path,
-                        'latest_version': update_info['latest_version'],
-                        'release_notes': update_info['release_notes']
-                    }, f)
-                
-                # 通知用户（如果在 Nuke 中）
-                try:
-                    import nuke
-                    nuke.executeInMainThread(lambda: nuke.message(
-                        "YB Tools 新版本 v{} 已下载完成！\n\n"
-                        "下次启动 Nuke 时将提示更新。".format(update_info['latest_version'])
-                    ))
-                except Exception:
-                    pass
-                    
-            except Exception as e:
-                print("[YB Tools] 创建更新标记失败: {}".format(str(e)))
+        version = update_info.get('latest_version', '')
+        release_notes = update_info.get('release_notes', '')
+        
+        def progress_callback(status, progress):
+            """Internal progress callback that forwards to status_callback"""
+            if status_callback:
+                if status == "downloading":
+                    status_callback("downloading", "Downloading update package... {}%".format(progress), progress)
+                else:
+                    status_callback(status, "", progress)
+        
+        # Show download message
+        _nuke_tprint("[YB Tools] Downloading update package...")
+        if status_callback:
+            status_callback("downloading", "Downloading update package...", 0)
+        
+        # Download update with progress
+        if not download_update(update_info['download_url'], zip_path, progress_callback=progress_callback):
+            error_msg = "Failed to download update package. Please check your network connection."
+            _nuke_tprint("[YB Tools] " + error_msg)
+            if status_callback:
+                status_callback("error", error_msg, None)
+            return
+        
+        # Show applying message
+        _nuke_tprint("[YB Tools] Applying update...")
+        if status_callback:
+            status_callback("applying", "Applying update...", None)
+        
+        # Apply update immediately
+        if apply_update(zip_path, new_version=version):
+            # Update successful - show notification
+            _nuke_tprint("="*70)
+            _nuke_tprint("[YB Tools] YB Tools has been updated to version {}.".format(version))
+            _nuke_tprint("="*70)
+            _nuke_tprint("[YB Tools] IMPORTANT: Please restart Nuke to use the new version.")
+            
+            restart_message = (
+                "Update completed successfully!\n\n"
+                "Version {} has been installed.\n\n"
+                "Please restart Nuke to use the new version.\n\n"
+                "Note: Nuke does not support hot reloading of plugins, "
+                "so a restart is required for the changes to take effect."
+            ).format(version)
+            
+            if status_callback:
+                status_callback("completed", restart_message, 100)
+        else:
+            error_msg = "Failed to apply update. Please try again or update manually."
+            _nuke_tprint("[YB Tools] " + error_msg)
+            if status_callback:
+                status_callback("error", error_msg, None)
     
-    # 启动后台线程
-    thread = threading.Thread(target=_download_thread)
-    thread.daemon = True  # 守护线程，不阻塞 Nuke 退出
+    # Start background thread
+    thread = threading.Thread(target=_download_and_apply_thread)
+    thread.daemon = True  # Daemon thread, won't block Nuke exit
     thread.start()
 
 
 def start_update_check():
     """
-    启动更新检查（在 Nuke 启动时调用）
+    Start update check (called after Nuke UI is loaded)
     
-    工作流程：
-    1. 检查 version.json 中的 auto_update 配置
-    2. 如果启用，首先检查是否有待应用的更新
-    3. 然后在后台检查 GitHub 上的新版本
-    4. 如果有新版本，后台下载
-    
-    整个过程不阻塞 Nuke 启动
+    Entire process doesn't block Nuke startup.
+    If update is found, it will be downloaded and applied immediately.
     """
-    # 检查是否启用自动更新
+    # Check if auto-update is enabled
     if not is_auto_update_enabled():
-        print("[YB Tools] 自动更新已禁用（在 version.json 中设置）")
         return
     
-    # 先检查待应用的更新
-    check_pending_update()
-    
-    # 后台检查新版本
+    # Check for new version in background
     def _check_thread():
         update_info = check_for_updates()
         
         if update_info and update_info['has_update']:
-            print("[YB Tools] 发现新版本: v{}".format(update_info['latest_version']))
-            
-            # 开始后台下载
-            download_update_async(update_info)
-        else:
-            print("[YB Tools] 当前已是最新版本 v{}".format(get_current_version()))
+            # Download and apply update immediately (silent download, show notification after)
+            download_and_apply_update_async(update_info, is_auto_update=True)
     
-    # 启动检查线程
+    # Start check thread
     thread = threading.Thread(target=_check_thread)
     thread.daemon = True
     thread.start()
 
 
-# 手动更新功能（可以添加到菜单）
-def manual_update_check():
+
+
+# Manual update function (can be added to menu)
+def manual_update_check(status_callback=None):
     """
-    手动检查更新（用户主动触发）
+    Manually check for updates (user-initiated)
+    Shows results in terminal and returns update info for UI display
+    
+    Args:
+        status_callback: Optional callback function(status, message, progress) for UI updates
+    
+    Returns:
+        dict: Update info dict with 'has_update', 'latest_version', etc.
     """
     try:
         import nuke
         
-        # 显示检查中的提示
-        print("[YB Tools] 正在检查更新...")
+        # Show checking status
+        if status_callback:
+            status_callback("checking", "Checking for updates...", None)
         
-        update_info = check_for_updates()
+        # Check for updates with error details
+        update_info = check_for_updates(return_error=True)
         
         if not update_info:
-            nuke.message("检查更新失败，请检查网络连接。")
-            return
+            error_msg = "Update check failed. Please check your network connection."
+            _nuke_tprint("[YB Tools] " + error_msg)
+            if status_callback:
+                status_callback("error", error_msg, None)
+            return {'error': error_msg}
+        
+        # Check if there's an error
+        if 'error' in update_info:
+            error_msg = "Update check failed: {}".format(update_info['error'])
+            _nuke_tprint("[YB Tools] " + error_msg)
+            if status_callback:
+                status_callback("error", error_msg, None)
+            return update_info
         
         if not update_info['has_update']:
-            nuke.message(
-                "当前已是最新版本！\n\n"
-                "当前版本: v{}\n"
-                "最新版本: v{}".format(get_current_version(), update_info['latest_version'])
+            msg = ("You are already on the latest version!\n"
+                   "Current version: v{}\n"
+                   "Latest version: v{}").format(
+                get_current_version(), update_info['latest_version']
             )
-            return
+            _nuke_tprint("[YB Tools] " + msg)
+            if status_callback:
+                status_callback("no_update", msg, None)
+            return update_info
         
-        # 询问是否下载更新
+        # Ask if user wants to download update
         result = nuke.ask(
-            "发现新版本！\n\n"
-            "当前版本: v{}\n"
-            "最新版本: v{}\n\n"
-            "更新内容:\n{}\n\n"
-            "是否立即下载？".format(
+            "New version found!\n\n"
+            "Current version: v{}\n"
+            "Latest version: v{}\n\n"
+            "Download now?".format(
                 get_current_version(),
-                update_info['latest_version'],
-                update_info.get('release_notes', '暂无说明')[:200]
+                update_info['latest_version']
             )
         )
         
         if result:
-            nuke.message("正在后台下载更新，请稍候...")
-            download_update_async(update_info)
+            # Download and apply update immediately with status callback
+            download_and_apply_update_async(update_info, is_auto_update=False, status_callback=status_callback)
+        else:
+            _nuke_tprint("[YB Tools] Update cancelled by user.")
+            if status_callback:
+                status_callback("cancelled", "Update cancelled by user.", None)
+        
+        return update_info
         
     except ImportError:
-        print("[YB Tools] 手动更新检查需要在 Nuke 环境中执行")
+        return {'error': 'Nuke module not available'}
+    except Exception as e:
+        error_msg = "Update check failed. Unexpected error: {}".format(str(e))
+        _nuke_tprint("[YB Tools] " + error_msg)
+        if status_callback:
+            status_callback("error", error_msg, None)
+        return {'error': error_msg}
 

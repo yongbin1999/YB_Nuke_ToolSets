@@ -14,6 +14,46 @@ import platform
 import re
 from typing import List
 
+# Safe subprocess launcher to prevent encoding issues in Nuke's frameserver
+def _safe_popen(cmd, **kwargs):
+    """
+    Safely launch a subprocess with output redirected to prevent encoding errors.
+    This prevents Nuke's frameserver from reading non-UTF-8 output.
+    
+    For file browser operations (explorer, open, xdg-open), we redirect all output
+    to devnull to prevent any non-UTF-8 characters from reaching Nuke's frameserver.
+    """
+    # Redirect stdout/stderr to devnull to prevent encoding issues
+    # This is critical for preventing UnicodeDecodeError in Nuke's frameserver
+    try:
+        # Use subprocess.DEVNULL if available (Python 3.3+)
+        if hasattr(subprocess, 'DEVNULL'):
+            kwargs.setdefault('stdout', subprocess.DEVNULL)
+            kwargs.setdefault('stderr', subprocess.DEVNULL)
+            kwargs.setdefault('stdin', subprocess.DEVNULL)
+        else:
+            # Fallback for older Python: open devnull file
+            devnull = open(os.devnull, 'wb')
+            kwargs.setdefault('stdout', devnull)
+            kwargs.setdefault('stderr', devnull)
+            kwargs.setdefault('stdin', devnull)
+    except Exception:
+        # Last resort: use PIPE and discard immediately
+        kwargs.setdefault('stdout', subprocess.PIPE)
+        kwargs.setdefault('stderr', subprocess.PIPE)
+        kwargs.setdefault('stdin', subprocess.PIPE)
+    
+    # Windows-specific: hide console window
+    if sys.platform == 'win32':
+        try:
+            # CREATE_NO_WINDOW flag prevents console window from appearing
+            kwargs.setdefault('creationflags', subprocess.CREATE_NO_WINDOW)
+        except AttributeError:
+            # CREATE_NO_WINDOW not available in older Python versions
+            pass
+    
+    return subprocess.Popen(cmd, **kwargs)
+
 try:
     from AEBridge import ae_jsx as _ae_jsx
 except Exception:
@@ -339,12 +379,12 @@ class AEBridgeNode(object):
             
             # 打开文件浏览器（仅打开文件夹，不选择文件）
             if system == 'Windows':
-                subprocess.Popen(['explorer', target_dir])
+                _safe_popen(['explorer', target_dir])
             elif system == 'Darwin':
-                subprocess.Popen(['open', target_dir])
+                _safe_popen(['open', target_dir])
             else:
                 # Linux
-                subprocess.Popen(['xdg-open', target_dir])
+                _safe_popen(['xdg-open', target_dir])
                 
         except Exception as e:
             nuke.message("Failed to open the file browser:\n{}".format(str(e)))
@@ -357,20 +397,20 @@ class AEBridgeNode(object):
             system = platform.system()
             if system == 'Windows':
                 if select_file and os.path.isfile(norm_path):
-                    subprocess.Popen(['explorer', '/select,', norm_path])
+                    _safe_popen(['explorer', '/select,', norm_path])
                 else:
                     folder = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-                    subprocess.Popen(['explorer', folder])
+                    _safe_popen(['explorer', folder])
             elif system == 'Darwin':
                 if select_file and os.path.isfile(norm_path):
-                    subprocess.Popen(['open', '-R', norm_path])
+                    _safe_popen(['open', '-R', norm_path])
                 else:
                     folder = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-                    subprocess.Popen(['open', folder])
+                    _safe_popen(['open', folder])
             else:
                 folder = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
                 if folder:
-                    subprocess.Popen(['xdg-open', folder])
+                    _safe_popen(['xdg-open', folder])
         except Exception:
             pass
 
@@ -385,8 +425,18 @@ class AEBridgeNode(object):
                 os.path.join(system_root, 'System32', 'Wbem')
             ]
             env['PATH'] = ';'.join([p for p in path_candidates if p])
+            # Set UTF-8 encoding for Windows to avoid UnicodeDecodeError
+            # This helps prevent encoding issues when subprocess outputs are read
+            env['PYTHONIOENCODING'] = 'utf-8'
+            # Also set console code page to UTF-8 if possible
+            try:
+                import subprocess
+                subprocess.run(['chcp', '65001'], shell=True, capture_output=True, timeout=1)
+            except Exception:
+                pass
         else:
             env['PATH'] = '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin'
+            env['PYTHONIOENCODING'] = 'utf-8'
         for key in ['NUKE_PATH', 'PYTHONPATH', 'PYTHONHOME']:
             env.pop(key, None)
         return env
@@ -497,12 +547,29 @@ class AEBridgeNode(object):
         """Launch After Effects with an inline -s script that loads the installed JSX."""
         env = self._build_clean_env()
         try:
-            proc = subprocess.Popen([ae_exe, '-s', inline_script], cwd=aep_dir, env=env)
+            # Capture stdout/stderr to prevent encoding issues in Nuke's frameserver
+            # Use errors='replace' to handle any non-UTF-8 characters gracefully
+            proc = subprocess.Popen(
+                [ae_exe, '-s', inline_script], 
+                cwd=aep_dir, 
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+            # Read and discard output to prevent encoding issues
+            # This prevents the output from being passed to Nuke's frameserver
+            try:
+                stdout, stderr = proc.communicate(timeout=300)  # 5 minute timeout
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
         except Exception as exc:
             nuke.message("Failed to launch After Effects:\n{}".format(str(exc)))
-            nuke.message("After Effects returned exit code {}; check the AE log.".format(proc.returncode))
             return False
-        ret = proc.wait()
+        ret = proc.returncode
         if ret != 0:
             nuke.message("After Effects returned exit code {}; check the AE log.".format(ret))
             return False
@@ -558,20 +625,20 @@ class AEBridgeNode(object):
             system = platform.system()
             if system == 'Windows':
                 if select_file and os.path.isfile(norm_path):
-                    subprocess.Popen(['explorer', '/select,', norm_path])
+                    _safe_popen(['explorer', '/select,', norm_path])
                 else:
                     folder = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-                    subprocess.Popen(['explorer', folder])
+                    _safe_popen(['explorer', folder])
             elif system == 'Darwin':
                 if select_file and os.path.isfile(norm_path):
-                    subprocess.Popen(['open', '-R', norm_path])
+                    _safe_popen(['open', '-R', norm_path])
                 else:
                     folder = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
-                    subprocess.Popen(['open', folder])
+                    _safe_popen(['open', folder])
             else:
                 folder = norm_path if os.path.isdir(norm_path) else os.path.dirname(norm_path)
                 if folder:
-                    subprocess.Popen(['xdg-open', folder])
+                    _safe_popen(['xdg-open', folder])
         except Exception:
             pass
 
@@ -674,7 +741,27 @@ class AEBridgeNode(object):
             return
 
         try:
-            subprocess.Popen([ae_exe, ae_project_path])
+            env = self._build_clean_env()
+            # Capture output to prevent encoding issues in Nuke's frameserver
+            proc = subprocess.Popen(
+                [ae_exe, ae_project_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+            # Don't wait for process, but discard output in background
+            # This prevents the output from being passed to Nuke's frameserver
+            import threading
+            def discard_output():
+                try:
+                    proc.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass  # Process is still running, which is fine
+            thread = threading.Thread(target=discard_output, daemon=True)
+            thread.start()
             nuke.message("Opening the After Effects project...")
         except Exception as e:
             nuke.message("Failed to open the After Effects project:\n{}".format(str(e)))
@@ -1726,7 +1813,7 @@ exit
                     f.write(bat_content)
 
                 if not auto_run:
-                    subprocess.Popen(['explorer', '/select,', os.path.normpath(launcher_script)])
+                    _safe_popen(['explorer', '/select,', os.path.normpath(launcher_script)])
                     #nuke.message("✅ 请运行选中的批处理文件以创建 AE 工程")
                 else:
                     if not self._run_afterfx_inline(ae_exe_win, inline_script_win, aep_dir_win, auto_close):
@@ -1763,9 +1850,9 @@ exit 0
 
                 if not auto_run:
                     if platform.system() == 'Darwin':
-                        subprocess.Popen(['open', '-R', launcher_script])
+                        _safe_popen(['open', '-R', launcher_script])
                     else:
-                        subprocess.Popen(['xdg-open', scripts_dir])
+                        _safe_popen(['xdg-open', scripts_dir])
                     #nuke.message("✅ 请运行选中的脚本以创建 AE 工程")
                 else:
                     if not self._run_afterfx_inline(ae_exe, inline_script_mac, aep_dir, auto_close):
@@ -1887,7 +1974,7 @@ exit 0
                 digits = seq_info.get('digits', 4)
                 first_file = seq_info['pattern'].replace('%0{}d'.format(digits), str(seq_info['first']).zfill(digits))
                 if os.path.exists(first_file):
-                    if not nuke.ask('检测到已存在序列 ({ext}):\n{path}\n\n是否覆盖重新渲染？'.format(ext=seq_info['ext'], path=first_file)):
+                    if not nuke.ask('Detected existing sequence ({ext}):\n{path}\n\nOverwrite and re-render?'.format(ext=seq_info['ext'], path=first_file)):
                         seq_target = {
                             'type': 'sequence',
                             'pattern': normalize_path(seq_info['pattern']),
@@ -1971,7 +2058,7 @@ exit
                 with open(render_script, 'w', encoding='utf-8-sig') as f:
                     f.write(bat_content)
 
-                subprocess.Popen(['explorer', '/select,', os.path.normpath(render_script)])
+                _safe_popen(['explorer', '/select,', os.path.normpath(render_script)])
                 #nuke.message('✅ 已生成 AE 渲染脚本，请在资源管理器中执行以导出序列。')
 
             else:
@@ -2006,9 +2093,9 @@ exit 0
                 os.chmod(render_script, 0o755)
 
                 if system == 'Darwin':
-                    subprocess.Popen(['open', '-R', render_script])
+                    _safe_popen(['open', '-R', render_script])
                 else:
-                    subprocess.Popen(['xdg-open', scripts_dir])
+                    _safe_popen(['xdg-open', scripts_dir])
 
                 #nuke.message('✅ 已生成 AE 渲染脚本，请在终端中执行以导出 PNG 序列。')
 
